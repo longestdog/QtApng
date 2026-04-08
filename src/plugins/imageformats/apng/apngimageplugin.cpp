@@ -12,6 +12,8 @@ QImageIOPlugin::Capabilities ApngImagePlugin::capabilities(QIODevice *device, co
 		return CanRead;
 	if (!format.isEmpty())
 		return static_cast<Capability>(0);
+	if (!device)
+		return static_cast<Capability>(0);
 	if (!device->isOpen())
 		return static_cast<Capability>(0);
 
