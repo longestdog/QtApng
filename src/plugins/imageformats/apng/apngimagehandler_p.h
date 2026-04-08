@@ -81,6 +81,8 @@ private:
     png_structp png_ptr{};
     png_infop   info_ptr{};
     QImage *m_composited{};   // For animation frames composition
+    // Row pointer table for png_read_image; must survive libpng longjmp (no C++ unwinding)
+    png_bytepp m_rowPtrTableAlloc{};
 };
 
 #endif // APNGIMAGEHANDLER_P_H

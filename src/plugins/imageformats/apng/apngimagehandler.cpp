@@ -1,4 +1,6 @@
 #include "apngimagehandler_p.h"
+#include <cstdlib>
+#include <cstring>
 #include <qcolor.h>
 #include <qimage.h>
 #include <qdebug.h>
@@ -14,10 +16,14 @@ QApngHandler::QApngHandler()
 
 QApngHandler::~QApngHandler()
 {
-    if (png_ptr && info_ptr)
-        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+    std::free(m_rowPtrTableAlloc);
+    m_rowPtrTableAlloc = nullptr;
+
+    if (png_ptr)
+        png_destroy_read_struct(&png_ptr, info_ptr ? &info_ptr : nullptr, nullptr);
 
     delete m_composited;
+    m_composited = nullptr;
 }
 
 bool QApngHandler::canRead() const
@@ -53,12 +59,20 @@ bool QApngHandler::canRead(QIODevice *device)
 
 void QApngHandler::readCallback(png_structp png_ptr, png_byte* raw_data, png_size_t read_length)
 {
-    QApngHandler* handle = (QApngHandler*)png_get_io_ptr(png_ptr);
+    auto *handle = static_cast<QApngHandler *>(png_get_io_ptr(png_ptr));
+    if (!handle || !raw_data || read_length == 0)
+        return;
 
-    if (handle->m_rawDataReadIndex + read_length < (png_size_t)handle->m_rawData.size()) {
-        memcpy(raw_data, handle->m_rawData.data() + handle->m_rawDataReadIndex, read_length);
-        handle->m_rawDataReadIndex += read_length;
-    }
+    const QByteArray &buf = handle->m_rawData;
+    const png_size_t idx = handle->m_rawDataReadIndex;
+    const png_size_t bufSize = static_cast<png_size_t>(buf.size());
+    const png_size_t avail = (bufSize > idx) ? (bufSize - idx) : 0;
+    const png_size_t n = (read_length <= avail) ? read_length : avail;
+    if (n > 0)
+        std::memcpy(raw_data, buf.constData() + idx, static_cast<size_t>(n));
+    if (read_length > n)
+        std::memset(raw_data + n, 0, static_cast<size_t>(read_length - n));
+    handle->m_rawDataReadIndex += read_length;
 }
 
 bool QApngHandler::ensureScanned() const
@@ -68,31 +82,48 @@ bool QApngHandler::ensureScanned() const
 
     m_scanState = ScanError;
 
-    if (device()->isSequential()) {
+    QIODevice *dev = device();
+    if (!dev) {
+        qWarning() << "QApngHandler::ensureScanned: no device";
+        return false;
+    }
+
+    if (dev->isSequential()) {
         qWarning() << "Sequential devices are not supported";
         return false;
     }
 
-    qint64 oldPos = device()->pos();
-    device()->seek(0);
+    qint64 oldPos = dev->pos();
+    dev->seek(0);
 
     QApngHandler *that = const_cast<QApngHandler *>(this);
-    if (!that->canRead(device()))
+    if (!that->canRead(dev))
         return false;
 
     that->ensureDemuxer();
 
     that->png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-    that->info_ptr = png_create_info_struct(png_ptr);
-    if (!that->png_ptr || !that->info_ptr) {
+    if (!that->png_ptr) {
         qCritical() << "failed to create apng struct";
         return false;
     }
-
-    png_set_read_fn(png_ptr, (png_voidp)this, QApngHandler::readCallback);
-
-    if (setjmp(png_jmpbuf(png_ptr)))
+    that->info_ptr = png_create_info_struct(that->png_ptr);
+    if (!that->info_ptr) {
+        png_destroy_read_struct(&that->png_ptr, nullptr, nullptr);
+        qCritical() << "failed to create apng info struct";
         return false;
+    }
+
+    png_set_read_fn(png_ptr, (png_voidp)that, QApngHandler::readCallback);
+
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        delete that->m_composited;
+        that->m_composited = nullptr;
+        png_destroy_read_struct(&that->png_ptr, &that->info_ptr, nullptr);
+        if (dev)
+            dev->seek(oldPos);
+        return false;
+    }
     png_set_sig_bytes(png_ptr, pngHeaderSize);
     that->m_rawDataReadIndex += pngHeaderSize;
     png_read_info(png_ptr, info_ptr);
@@ -118,10 +149,16 @@ bool QApngHandler::ensureScanned() const
         that->m_hasAnimation = true;
         that->m_skipFirst = png_get_first_frame_is_hidden(png_ptr, info_ptr);
         that->m_composited = new QImage(that->m_imageSize.width(), that->m_imageSize.height(), QImage::Format_ARGB32);
-        that->m_composited->fill(Qt::transparent);
+        if (!that->m_composited->isNull())
+            that->m_composited->fill(Qt::transparent);
+        else {
+            delete that->m_composited;
+            that->m_composited = nullptr;
+            png_error(png_ptr, "apng: compositing buffer allocation failed");
+        }
     }
 
-    device()->seek(oldPos);
+    dev->seek(oldPos);
 
     m_scanState = ScanSuccess;
     return true;
@@ -132,14 +169,27 @@ bool QApngHandler::ensureDemuxer()
     if (!m_rawData.isEmpty())
         return true;
 
-    m_rawData = device()->readAll();
+    QIODevice *dev = device();
+    if (!dev)
+        return false;
+    m_rawData = dev->readAll();
     return true;
 }
 
 bool QApngHandler::read(QImage *image)
 {
-    if (!ensureScanned() || device()->isSequential() || !ensureDemuxer())
+    if (!image)
         return false;
+    if (!ensureScanned() || !device() || device()->isSequential() || !ensureDemuxer())
+        return false;
+    if (m_hasAnimation && !m_composited)
+        return false;
+
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        std::free(m_rowPtrTableAlloc);
+        m_rowPtrTableAlloc = nullptr;
+        return false;
+    }
 
     QRect prevFrameRect;
     if (m_frameInfo.frame_num != 0 && m_frameInfo.dop == PNG_DISPOSE_OP_BACKGROUND)
@@ -168,14 +218,25 @@ bool QApngHandler::read(QImage *image)
     }
 
     QImage frame(m_frameInfo.width, m_frameInfo.height, QImage::Format_ARGB32);
+    if (frame.isNull())
+        return false;
 
-    png_bytepp rows_frame = (png_bytepp)malloc(m_frameInfo.height * sizeof(png_bytep));
+    std::free(m_rowPtrTableAlloc);
+    m_rowPtrTableAlloc = nullptr;
+    if (m_frameInfo.height == 0 || m_frameInfo.width == 0)
+        return false;
+    m_rowPtrTableAlloc = static_cast<png_bytepp>(
+        std::malloc(static_cast<size_t>(m_frameInfo.height) * sizeof(png_bytep)));
+    if (!m_rowPtrTableAlloc)
+        return false;
+    png_bytepp rows_frame = m_rowPtrTableAlloc;
     auto lineSize = m_frameInfo.width * 4;
     for (png_uint_32 i = 0; i < m_frameInfo.height; i++) {
         rows_frame[i] = frame.bits() + i * (lineSize);
     }
     png_read_image(png_ptr, rows_frame);
-    free(rows_frame);
+    std::free(m_rowPtrTableAlloc);
+    m_rowPtrTableAlloc = nullptr;
 
     if (!m_hasAnimation)
         *image = frame;

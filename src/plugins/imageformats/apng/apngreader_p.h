@@ -86,6 +86,9 @@ private:
 	bool readChunk(quint32 len = 0);
 	void copyOver();
 	void blendOver();
+
+	void releaseFrameBuffers();
+	void destroyPngDecoder();
 };
 
 #endif // APNGREADER_P_H

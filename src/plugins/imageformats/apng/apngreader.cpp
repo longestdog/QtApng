@@ -1,4 +1,5 @@
 #include "apngreader_p.h"
+#include <new>
 #include <QDebug>
 #include <QImage>
 #include <QRect>
@@ -12,13 +13,26 @@ ApngReader::ApngReader(QObject *parent) :
 
 ApngReader::~ApngReader()
 {
-	if(_png)
-		png_destroy_read_struct(&_png, &_info, nullptr);
+	destroyPngDecoder();
+	releaseFrameBuffers();
+}
 
-	if (_frame.rows)
+void ApngReader::releaseFrameBuffers()
+{
+	if (_frame.rows) {
 		delete[] _frame.rows;
-	if (_frame.p)
+		_frame.rows = nullptr;
+	}
+	if (_frame.p) {
 		delete[] _frame.p;
+		_frame.p = nullptr;
+	}
+}
+
+void ApngReader::destroyPngDecoder()
+{
+	if (_png)
+		png_destroy_read_struct(&_png, _info ? &_info : nullptr, nullptr);
 }
 
 bool ApngReader::checkPngSig(QIODevice *device)
@@ -41,6 +55,9 @@ bool ApngReader::init(QIODevice *device)
 		return _infoOffset > 0;
 	}
 
+	destroyPngDecoder();
+	releaseFrameBuffers();
+
 	//verify png
 	if(checkPngSig(device))
 		_device = device;
@@ -60,6 +77,7 @@ bool ApngReader::init(QIODevice *device)
 	_info = png_create_info_struct(_png);
 	if(!_info) {
 		qCritical() << "failed to create info struct";
+		png_destroy_read_struct(&_png, nullptr, nullptr);
 		return false;
 	}
 
@@ -68,6 +86,8 @@ bool ApngReader::init(QIODevice *device)
 	//set png jump position
 	if (setjmp(png_jmpbuf(_png))) {
 		_infoOffset = 0;
+		destroyPngDecoder();
+		releaseFrameBuffers();
 		return false;
 	}
 
@@ -90,8 +110,14 @@ ApngReader::ApngFrame ApngReader::readFrame(int index)
 	if(index < _allFrames.size())
 		return _allFrames[index];
 
-	if (setjmp(png_jmpbuf(_png)))
+	if (!_png)
 		return {};
+
+	if (setjmp(png_jmpbuf(_png))) {
+		destroyPngDecoder();
+		releaseFrameBuffers();
+		return {};
+	}
 
 	auto valid = false;
 	do {
@@ -154,8 +180,15 @@ void ApngReader::info_fn(png_structp png_ptr, png_infop info_ptr)
 	frame.dop = PNG_DISPOSE_OP_NONE;
 	frame.bop = PNG_BLEND_OP_SOURCE;
 	frame.rowbytes = png_get_rowbytes(png_ptr, info_ptr);
-	frame.p = new unsigned char[frame.height * frame.rowbytes];
-	frame.rows = new png_bytep[frame.height * sizeof(png_bytep)];
+	frame.p = new (std::nothrow) unsigned char[frame.height * frame.rowbytes];
+	frame.rows = new (std::nothrow) png_bytep[frame.height];
+	if (!frame.p || !frame.rows) {
+		delete[] frame.rows;
+		frame.rows = nullptr;
+		delete[] frame.p;
+		frame.p = nullptr;
+		png_error(png_ptr, "apng: out of memory");
+	}
 	for (quint32 j = 0; j < frame.height; j++)
 		frame.rows[j] = frame.p + j * frame.rowbytes;
 
@@ -179,13 +212,18 @@ void ApngReader::info_fn(png_structp png_ptr, png_infop info_ptr)
 	} else
 		reader->_animated = false;
 
-	reader->_infoOffset = reader->_device->pos();
+	if (reader->_device)
+		reader->_infoOffset = reader->_device->pos();
+	else
+		png_error(png_ptr, "apng: no device");
 }
 
 void ApngReader::row_fn(png_structp png_ptr, png_bytep new_row, png_uint_32 row_num, int pass)
 {
 	Q_UNUSED(pass)
 	auto reader = reinterpret_cast<ApngReader*>(png_get_io_ptr(png_ptr));
+	if (!reader || !reader->_frame.rows || row_num >= reader->_frame.height)
+		return;
 	png_progressive_combine_row(png_ptr, reader->_frame.rows[row_num], new_row);
 }
 
@@ -268,6 +306,9 @@ void ApngReader::frame_end_fn(png_structp png_ptr, png_uint_32 frame_num)
 
 bool ApngReader::readChunk(quint32 len)
 {
+	if (!_device || !_png)
+		return false;
+
 	QByteArray data;
 	if(len == 0) {// read exactly 1 chunk
 		//read 4 bytes -> size
@@ -286,11 +327,16 @@ bool ApngReader::readChunk(quint32 len)
 
 void ApngReader::copyOver()
 {
+    if (_lastImg.isNull() || !_frame.p || !_frame.rows || _frame.height == 0 || _frame.width == 0)
+        return;
+
     if ((int)_frame.width == _lastImg.width() && (int)_frame.height == _lastImg.height()) {
         memcpy(_lastImg.bits(), _frame.p, _frame.rowbytes * _frame.height);
     } else {
         int lineSize = _frame.width * 4;
         QImage image(_frame.width, _frame.height, QImage::Format_RGBA8888);
+        if (image.isNull())
+            return;
         for(quint32 y = 0; y < _frame.height; y++) {
             memcpy(image.bits() + lineSize * y, _frame.rows[y], lineSize);
         }
@@ -302,7 +348,13 @@ void ApngReader::copyOver()
 
 void ApngReader::blendOver()
 {
+    if (_lastImg.isNull() || !_frame.p || !_frame.rows || _frame.height == 0 || _frame.width == 0)
+        return;
+
     QImage image(_frame.width, _frame.height, QImage::Format_ARGB32);
+    if (image.isNull())
+        return;
+
     if ((int)_frame.width == _lastImg.width() && (int)_frame.height == _lastImg.height()) {
         memcpy(image.bits(), _frame.p, _frame.rowbytes * _frame.height);
     } else {
