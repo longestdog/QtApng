@@ -47,7 +47,7 @@ bool ApngReader::checkPngSig(QIODevice *device)
 
 bool ApngReader::init(QIODevice *device)
 {
-	if (_device == device) {
+	if (device && _device == device) {
 		if (_device->pos() < _infoOffset) {
 			_allFrames.clear();
 			_device->seek(_infoOffset);
@@ -153,6 +153,8 @@ quint32 ApngReader::plays() const
 void ApngReader::info_fn(png_structp png_ptr, png_infop info_ptr)
 {
 	auto reader = reinterpret_cast<ApngReader*>(png_get_io_ptr(png_ptr));
+	if (!reader)
+		png_error(png_ptr, "apng: invalid reader in info_fn");
 	Frame &frame = reader->_frame;
 
 	//init png reading
@@ -231,6 +233,8 @@ void ApngReader::end_fn(png_structp png_ptr, png_infop info_ptr)
 {
 	Q_UNUSED(info_ptr);
 	auto reader = reinterpret_cast<ApngReader*>(png_get_io_ptr(png_ptr));
+	if (!reader)
+		png_error(png_ptr, "apng: invalid reader in end_fn");
 	Frame &frame = reader->_frame;
 
 	if(!reader->_animated) {
@@ -252,6 +256,8 @@ void ApngReader::frame_info_fn(png_structp png_ptr, png_uint_32 frame_num)
 {
 	Q_UNUSED(frame_num);
 	auto reader = reinterpret_cast<ApngReader*>(png_get_io_ptr(png_ptr));
+	if (!reader || !reader->_info)
+		png_error(png_ptr, "apng: invalid reader in frame_info_fn");
 	auto info_ptr = reader->_info;
 	Frame &frame = reader->_frame;
 
@@ -268,6 +274,8 @@ void ApngReader::frame_info_fn(png_structp png_ptr, png_uint_32 frame_num)
 void ApngReader::frame_end_fn(png_structp png_ptr, png_uint_32 frame_num)
 {
 	auto reader = reinterpret_cast<ApngReader*>(png_get_io_ptr(png_ptr));
+	if (!reader)
+		png_error(png_ptr, "apng: invalid reader in frame_end_fn");
 	Frame &frame = reader->_frame;
 	auto &image = reader->_lastImg;
 
@@ -373,7 +381,7 @@ void ApngReader::blendOver()
 
 ApngReader::ApngFrame::ApngFrame(const QImage &image, quint16 delay_num, quint16 delay_den) :
 	QImage{image},
-	_delay{static_cast<double>(delay_num) / static_cast<double>(delay_den)}
+	_delay{static_cast<double>(delay_num) / static_cast<double>(delay_den ? delay_den : 100)}
 {}
 
 double ApngReader::ApngFrame::delay() const

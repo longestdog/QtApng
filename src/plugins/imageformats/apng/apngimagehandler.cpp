@@ -100,7 +100,8 @@ bool QApngHandler::ensureScanned() const
     if (!that->canRead(dev))
         return false;
 
-    that->ensureDemuxer();
+    if (!that->ensureDemuxer())
+        return false;
 
     that->png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
     if (!that->png_ptr) {
@@ -329,6 +330,7 @@ int QApngHandler::nextImageDelay() const
     if (!ensureScanned() || !m_hasAnimation)
         return 0;
 
-    auto delay = static_cast<double>(m_frameInfo.delay_num) / static_cast<double>(m_frameInfo.delay_den);
+    const unsigned den = m_frameInfo.delay_den ? m_frameInfo.delay_den : 100u;
+    const auto delay = static_cast<double>(m_frameInfo.delay_num) / static_cast<double>(den);
     return qRound(delay * 1000);
 }
